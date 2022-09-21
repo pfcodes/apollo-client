@@ -1,5 +1,16 @@
 import gql from 'graphql-tag';
-import { DocumentNode, GraphQLError, getIntrospectionQuery } from 'graphql';
+import { graphql, print } from 'graphql';
+import { GraphQLJSON } from "graphql-scalars";
+import {
+  DocumentNode,
+  GraphQLError,
+  getIntrospectionQuery,
+  GraphQLSchema,
+  GraphQLObjectType,
+  GraphQLID,
+  GraphQLString,
+  GraphQLList
+} from 'graphql';
 
 import { Observable } from '../../utilities';
 import { ApolloLink } from '../../link/core';
@@ -817,6 +828,119 @@ describe('Combining client and server state/operations', () => {
     setTimeout(() => {
       client.mutate({ mutation, variables });
     }, 10);
+  });
+
+  itAsync.only('bug fix for #10105', (resolve, reject) => {
+    const request = {
+      query: gql`
+        query people($id: ID, $list: JSON) {
+          people(id: $id, list: $list) {
+            id
+            name
+          }
+        }
+      `,
+      variables: {
+        id: "test1",
+        list: [{ foo: "bar" }, { baz: "test" }, { testing: "thing" }]
+      },
+      notifyOnNetworkStatusChange: true
+    };
+
+    const PersonType = new GraphQLObjectType({
+      name: "Person",
+      fields: {
+        id: { type: GraphQLID },
+        name: { type: GraphQLString }
+      }
+    });
+
+    const peopleData = [
+      { id: 1, name: "John Smith" },
+      { id: 2, name: "Sara Smith" },
+      { id: 3, name: "Budd Deey" }
+    ];
+
+    const QueryType = new GraphQLObjectType({
+      name: "Query",
+      fields: {
+        people: {
+          type: new GraphQLList(PersonType),
+          args: {
+            id: {
+              type: GraphQLID
+            },
+            list: {
+              type: GraphQLJSON
+            }
+          },
+          resolve: () => peopleData
+        }
+      }
+    });
+
+    const schema = new GraphQLSchema({ query: QueryType });
+
+    function delay(wait: number) {
+      return new Promise(resolve => setTimeout(resolve, wait));
+    }
+
+    const link = new ApolloLink(operation => {
+      // @ts-ignore
+      return new Observable(async observer => {
+        const { query, operationName, variables } = operation;
+        await delay(300);
+        try {
+          const result = await graphql({
+            schema,
+            source: print(query),
+            variableValues: variables,
+            operationName,
+          });
+          observer.next(result);
+          observer.complete();
+        } catch (err) {
+          observer.error(err);
+        }
+      });
+    });
+
+    const client = new ApolloClient({
+      cache: new InMemoryCache(),
+      link,
+    });
+
+    const observer = client.watchQuery(request);
+
+    let count = 0;
+    observer.subscribe({
+      next: ({ loading, data }) => {
+        if (count === 0) expect(loading).toBe(false);
+        if (count === 1) expect(loading).toBe(true);
+        if (count === 2) expect(loading).toBe(false);
+        if (count === 3) expect(loading).toBe(true);
+        if (count === 4) {
+          expect(loading).toBe(false)
+          resolve();
+        };
+        count++;
+      },
+      error: reject,
+    });
+
+    setTimeout(() => {
+      observer.refetch({
+        id: "test2",
+        list: [{ foo: "bar" }, { baz: "test" }, { testing: "thing" }]
+      });
+    }, 2000);
+
+    setTimeout(() => {
+      observer.refetch({
+        id: "test2",
+        list: [{ foo: "bar" }, { baz: "test" }]
+      });
+    }, 4000);
   });
 
   itAsync('should correctly propagate an error from a client resolver', async (resolve, reject) => {
